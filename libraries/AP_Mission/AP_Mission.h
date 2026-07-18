@@ -153,6 +153,7 @@ public:
     struct PACKED Cam_Trigg_Distance {
         float meters;           // distance
         uint8_t trigger;        // triggers one image capture immediately
+        uint8_t camera_id;      // which camera to trigger
     };
 
     // gripper command structure
@@ -277,12 +278,14 @@ public:
     struct PACKED set_camera_zoom_Command {
         uint8_t zoom_type;
         float zoom_value;
+        uint8_t camera_id;
     };
 
     // MAV_CMD_SET_CAMERA_FOCUS support
     struct PACKED set_camera_focus_Command {
         uint8_t focus_type;
         float focus_value;
+        uint8_t camera_id;
     };
 
     // MAV_CMD_SET_CAMERA_SOURCE support
@@ -301,6 +304,16 @@ public:
     struct PACKED video_stop_capture_Command {
         uint8_t video_stream_id;
     };
+
+#if AP_MISSION_MAV_CMD_DO_SET_ROI_WPNEXT_OFFSET_ENABLED
+    // MAV_CMD_DO_SET_ROI_WPNEXT_OFFSET support
+    struct PACKED ROI_WPNext_Offset_Command {
+        int16_t roll_offset_cd;
+        int16_t pitch_offset_cd;
+        int16_t yaw_offset_cd;
+        uint8_t gimbal_id;
+    };
+#endif  // AP_MISSION_MAV_CMD_DO_SET_ROI_WPNEXT_OFFSET_ENABLED
 
     union Content {
         // jump structure
@@ -401,6 +414,11 @@ public:
         // MAV_CMD_VIDEO_STOP_CAPTURE support
         video_stop_capture_Command video_stop_capture;
 
+#if AP_MISSION_MAV_CMD_DO_SET_ROI_WPNEXT_OFFSET_ENABLED
+        // MAV_CMD_DO_SET_ROI_WPNEXT_OFFSET
+        ROI_WPNext_Offset_Command wpnext_offset;
+#endif  // AP_MISSION_MAV_CMD_DO_SET_ROI_WPNEXT_OFFSET_ENABLED
+
         // location
         Location location{};      // Waypoint location
     };
@@ -434,6 +452,15 @@ public:
                 turns *= (1.0/256.0);
             }
             return turns;
+        }
+
+        /*
+          return the arc angle in radians for an ARC_WAYPOINT command
+          this has special handling for arc waypoints using cmd.p1 and loiter_ccw
+         */
+        float get_arc_angle_rad(void) const {
+            const float sign = (content.location.loiter_ccw == 0) ? 1.0f : -1.0f;
+            return radians(float(p1) * sign);
         }
     };
 
@@ -507,6 +534,9 @@ public:
         return _commands_max;
     }
 
+    // Present - returns true if there is a mission currently loaded, ignoring home which is stored in index 0
+    bool present() const { return _cmd_total > 1; }
+
     /// start - resets current commands to point to the beginning of the mission
     ///     To-Do: should we validate the mission first and return true/false?
     void start();
@@ -526,6 +556,9 @@ public:
 
     /// reset - reset mission to the first command
     void reset();
+
+    /// reset_jump_counters - reset DO_JUMP counters to their initial values without affecting current position
+    void reset_jump_counters() { init_jump_tracking(); }
 
     /// clear - clears out mission
     bool clear();
@@ -631,11 +664,6 @@ public:
     ///     true is return if successful
     bool read_cmd_from_storage(uint16_t index, Mission_Command& cmd) const;
 
-    /// write_cmd_to_storage - write a command to storage
-    ///     cmd.index is used to calculate the storage location
-    ///     true is returned if successful
-    bool write_cmd_to_storage(uint16_t index, const Mission_Command& cmd);
-
     /// write_home_to_storage - writes the special purpose cmd 0 (home) to storage
     ///     home is taken directly from ahrs
     void write_home_to_storage();
@@ -735,9 +763,10 @@ public:
       disarm and mission logic should stop
      */
     enum class Option {
-        CLEAR_ON_BOOT            =  0,  // clear mission on vehicle boot
-        FAILSAFE_TO_BEST_LANDING =  1,  // on failsafe, find fastest path along mission home
-        CONTINUE_AFTER_LAND      =  2,  // continue running mission (do not disarm) after land if takeoff is next waypoint
+        CLEAR_ON_BOOT            = (1U<<0), // clear mission on vehicle boot
+        FAILSAFE_TO_BEST_LANDING = (1U<<1), // on failsafe, find fastest path along mission home
+        CONTINUE_AFTER_LAND      = (1U<<2), // continue running mission (do not disarm) after land if takeoff is next waypoint
+        DONT_ZERO_COUNTER        = (1U<<3), // don't zero counter on completion
     };
     bool option_is_set(Option option) const {
         return (_options.get() & (uint16_t)option) != 0;
@@ -778,6 +807,10 @@ public:
     }
 #endif
 
+#if HAL_LOGGING_ENABLED
+    void set_log_start_mission_item_bit(uint32_t bit) { log_start_mission_item_bit = bit; }
+#endif
+
 private:
     static AP_Mission *_singleton;
 
@@ -806,6 +839,11 @@ private:
     ///
     /// private methods
     ///
+
+    /// write_cmd_to_storage - write a command to storage
+    ///     cmd.index is used to calculate the storage location
+    ///     true is returned if successful
+    bool write_cmd_to_storage(uint16_t index, const Mission_Command& cmd);
 
     /// complete - mission is marked complete and clean-up performed including calling the mission_complete_fn
     void complete();
@@ -865,7 +903,7 @@ private:
 
     // Approximate the distance traveled to return to the mission path. DO_JUMP commands are observed in look forward.
     // Stop searching once reaching a landing or do-land-start
-    bool distance_to_mission_leg(uint16_t index, float &rejoin_distance, uint16_t &rejoin_index, const Location& current_loc);
+    bool distance_to_mission_leg(uint16_t index, uint16_t &search_remaining, float &rejoin_distance, uint16_t &rejoin_index, const Location& current_loc);
 
     // calculate the location of a resume cmd wp
     bool calc_rewind_pos(Mission_Command& rewind_cmd);
@@ -943,12 +981,20 @@ private:
     bool start_command_do_scripting(const AP_Mission::Mission_Command& cmd);
     bool start_command_do_gimbal_manager_pitchyaw(const AP_Mission::Mission_Command& cmd);
     bool start_command_fence(const AP_Mission::Mission_Command& cmd);
+#if AP_MISSION_MAV_CMD_DO_SET_ROI_WPNEXT_OFFSET_ENABLED
+    bool start_command_do_set_roi_wpnext_offset(const AP_Mission::Mission_Command& cmd);
+#endif  // AP_MISSION_MAV_CMD_DO_SET_ROI_WPNEXT_OFFSET_ENABLED
 
     /*
       handle format conversion of storage format to allow us to update
       format to take advantage of new packing
      */
     void format_conversion(uint8_t tag_byte, const Mission_Command &cmd, PackedContent &packed_content) const;
+
+#if HAL_LOGGING_ENABLED
+    // if not -1, this bit in LOG_BITMASK specifies whether to log a message each time we start a command:
+    uint32_t log_start_mission_item_bit = -1;
+#endif
 };
 
 namespace AP

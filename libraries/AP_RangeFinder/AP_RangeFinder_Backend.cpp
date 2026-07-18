@@ -60,9 +60,9 @@ bool AP_RangeFinder_Backend::has_data() const {
 void AP_RangeFinder_Backend::update_status(RangeFinder::RangeFinder_State &state_arg) const
 {
     // check distance
-    if (state_arg.distance_m > max_distance_cm() * 0.01f) {
+    if (state_arg.distance_m > max_distance()) {
         set_status(state_arg, RangeFinder::Status::OutOfRangeHigh);
-    } else if (state_arg.distance_m < min_distance_cm() * 0.01f) {
+    } else if (state_arg.distance_m < min_distance()) {
         set_status(state_arg, RangeFinder::Status::OutOfRangeLow);
     } else {
         set_status(state_arg, RangeFinder::Status::Good);
@@ -82,6 +82,19 @@ void AP_RangeFinder_Backend::set_status(RangeFinder::RangeFinder_State &state_ar
     } else {
         state_arg.range_valid_count = 0;
     }
+}
+
+// get temperature reading in C.  returns true on success and populates temp argument
+// checks external temperature source first, then falls back to backend-specific reading
+bool AP_RangeFinder_Backend::get_temp(float &temp) const
+{
+#if AP_TEMPERATURE_SENSOR_ENABLED
+    if (state.temperature_valid && (AP_HAL::millis() - state.temperature_update_ms < 5000U)) {
+        temp = state.temperature_C;
+        return true;
+    }
+#endif
+    return _get_temp(temp);
 }
 
 #if AP_SCRIPTING_ENABLED

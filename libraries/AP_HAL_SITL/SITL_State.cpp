@@ -25,42 +25,11 @@
 #include <SITL/SIM_JSBSim.h>
 #include <AP_HAL/utility/Socket_native.h>
 
+#include <AP_HAL/SIMState.h>
+
 extern const AP_HAL::HAL& hal;
 
 using namespace HALSITL;
-
-void SITL_State::_set_param_default(const char *parm)
-{
-    char *pdup = strdup(parm);
-    char *p = strchr(pdup, '=');
-    if (p == nullptr) {
-        printf("Please specify parameter as NAME=VALUE");
-        exit(1);
-    }
-    float value = strtof(p+1, nullptr);
-    *p = 0;
-    enum ap_var_type var_type;
-    AP_Param *vp = AP_Param::find(pdup, &var_type);
-    if (vp == nullptr) {
-        printf("Unknown parameter %s\n", pdup);
-        exit(1);
-    }
-    if (var_type == AP_PARAM_FLOAT) {
-        ((AP_Float *)vp)->set_and_save(value);
-    } else if (var_type == AP_PARAM_INT32) {
-        ((AP_Int32 *)vp)->set_and_save(value);
-    } else if (var_type == AP_PARAM_INT16) {
-        ((AP_Int16 *)vp)->set_and_save(value);
-    } else if (var_type == AP_PARAM_INT8) {
-        ((AP_Int8 *)vp)->set_and_save(value);
-    } else {
-        printf("Unable to set parameter %s\n", pdup);
-        exit(1);
-    }
-    printf("Set parameter %s to %f\n", pdup, value);
-    free(pdup);
-}
-
 
 /*
   setup for SITL handling
@@ -73,7 +42,6 @@ void SITL_State::_sitl_setup()
 
     fprintf(stdout, "Starting SITL input\n");
 
-    // find the barometer object if it exists
     _sitl = AP::sitl();
 
     if (_sitl != nullptr) {
@@ -81,7 +49,9 @@ void SITL_State::_sitl_setup()
         _update_airspeed(0);
 #if AP_SIM_SOLOGIMBAL_ENABLED
         if (enable_gimbal) {
-            gimbal = NEW_NOTHROW SITL::SoloGimbal();
+            // the gimbal connects back to the vehicle's SERIAL2 MAVLink
+            // port, which is base_port + 2 (offset by the SITL instance):
+            gimbal = NEW_NOTHROW SITL::SoloGimbal(base_port() + 2);
         }
 #endif
 
@@ -97,6 +67,7 @@ void SITL_State::_sitl_setup()
         sitl_model->set_dronecan_device(&_sitl->dronecan_sim);
 #endif
         if (_use_fg_view) {
+            fprintf(stdout, "FGView: %s:%u\n", _fg_address, _fg_view_port);
             fg_socket.connect(_fg_address, _fg_view_port);
         }
 
@@ -104,12 +75,13 @@ void SITL_State::_sitl_setup()
         _sitl->irlock_port = _irlock_port;
 
         _sitl->rcin_port = _rcin_port;
+
+        fprintf(stdout, "Using \\clock topic for DDS timing: %s\n", _use_dds_sim_time ? "enabled" : "disabled");
+        _sitl->use_dds_sim_time = _use_dds_sim_time;
     }
 
-    if (_synthetic_clock_mode) {
-        // start with non-zero clock
-        hal.scheduler->stop_clock(1);
-    }
+    // start with non-zero clock
+    hal.scheduler->stop_clock(1);
 }
 
 
@@ -176,7 +148,11 @@ void SITL_State::wait_clock(uint64_t wait_time_usec)
                 }
             }
 #endif
-            usleep(1000);
+            // most devices can't sleep for 10us - so this is also
+            // essentially a yield.  At 30x speedup a 10us wall-clock
+            // sleep here can equate to your thread sleeping for 300us
+            // of simulated time
+            usleep(10);
         }
     }
     // check the outbound TCP queue size.  If it is too long then
@@ -185,12 +161,14 @@ void SITL_State::wait_clock(uint64_t wait_time_usec)
     // conditions.
     if (speedup > 1 && hal.scheduler->in_main_thread()) {
         while (true) {
-            const int queue_length = ((HALSITL::UARTDriver*)hal.serial(0))->get_system_outqueue_length();
+            HALSITL::UARTDriver *uart = (HALSITL::UARTDriver*)hal.serial(0);
+            const int queue_length = uart->get_system_outqueue_length();
             // ::fprintf(stderr, "queue_length=%d\n", (signed)queue_length);
             if (queue_length < 1024) {
                 break;
             }
             _serial_0_outqueue_full_count++;
+            uart->handle_reading_from_device_to_readbuffer();
             usleep(1000);
         }
     }
@@ -216,8 +194,24 @@ void SITL_State::_output_to_flightgear(void)
     fdm.vcas  = sfdm.velocity_air_bf.length()/0.3048;
     if (_vehicle == ArduCopter) {
         fdm.num_engines = 4;
-        for (uint8_t i=0; i<4; i++) {
-            fdm.rpm[i] = constrain_float((pwm_output[i]-1000), 0, 1000);
+        if (_model_str != nullptr && strstr(_model_str, "heliquad") != nullptr) {
+            // copter variable-pitch quad (heli-quad). The packet has no
+            // field for blade collective, so it rides in an unused
+            // per-engine field which only the heliquad aircraft model XML
+            // reads:
+            //   rpm[i]       - rotor speed, from the shared RSC output
+            //   fuel_flow[i] - blade collective, -1..1 about trim
+            // collective servos are SERVO1-4, RSC is SERVO8 (copter-heli convention)
+            const float rsc = constrain_float((pwm_output[7]-1000)*0.001f, 0, 1);
+            for (uint8_t i=0; i<4; i++) {
+                fdm.rpm[i] = rsc * 1500;  // nominal head speed, rev/min
+                fdm.fuel_flow[i] = constrain_float((pwm_output[i]-1500)*0.002f, -1, 1);
+            }
+        } else {
+            // normal direct-drive fixed-pitch quadcopter
+            for (uint8_t i=0; i<4; i++) {
+                fdm.rpm[i] = constrain_float((pwm_output[i]-1000), 0, 1000);
+            }
         }
     } else {
         fdm.num_engines = 4;
@@ -245,10 +239,10 @@ void SITL_State::_fdm_input_local(void)
     // construct servos structure for FDM
     _simulator_servos(input);
 
-#if HAL_SIM_JSON_MASTER_ENABLED
+#if AP_SIM_JSON_MASTER_ENABLED
     // read servo inputs from ride along flight controllers
     ride_along.receive(input);
-#endif
+#endif  // AP_SIM_JSON_MASTER_ENABLED
 
     // replace outputs from multicast
     multicast_servo_update(input);
@@ -266,10 +260,10 @@ void SITL_State::_fdm_input_local(void)
     }
 #endif
 
-#if HAL_SIM_JSON_MASTER_ENABLED
+#if AP_SIM_JSON_MASTER_ENABLED
     // output JSON state to ride along flight controllers
     ride_along.send(_sitl->state,sitl_model->get_position_relhome());
-#endif
+#endif  // AP_SIM_JSON_MASTER_ENABLED
 
     sim_update();
 
@@ -282,7 +276,6 @@ void SITL_State::_fdm_input_local(void)
 
     set_height_agl();
 
-    _synthetic_clock_mode = true;
     _update_count++;
 }
 
@@ -294,83 +287,10 @@ void SITL_State::_simulator_servos(struct sitl_input &input)
     if (_sitl == nullptr) {
         return;
     }
-    static uint32_t last_update_usec;
 
-    /* this maps the registers used for PWM outputs. The RC
-     * driver updates these whenever it wants the channel output
-     * to change */
-
-    if (last_update_usec == 0 || !output_ready) {
-        for (uint8_t i=0; i<SITL_NUM_CHANNELS; i++) {
-            pwm_output[i] = 1000;
-        }
-        if (_vehicle == ArduPlane) {
-            pwm_output[0] = pwm_output[1] = pwm_output[3] = 1500;
-        }
-        if (_vehicle == Rover) {
-            pwm_output[0] = pwm_output[1] = pwm_output[2] = pwm_output[3] = 1500;
-        }
-        if (_vehicle == ArduSub) {
-            pwm_output[0] = pwm_output[1] = pwm_output[2] = pwm_output[3] =
-                    pwm_output[4] = pwm_output[5] = pwm_output[6] = pwm_output[7] = 1500;
-        }
-    }
-
-    // output at chosen framerate
-    uint32_t now = AP_HAL::micros();
-    last_update_usec = now;
-
-    float altitude = AP::baro().get_altitude();
-    float wind_speed = 0;
-    float wind_direction = 0;
-    float wind_dir_z = 0;
-
-    // give 5 seconds to calibrate airspeed sensor at 0 wind speed
-    if (wind_start_delay_micros == 0) {
-        wind_start_delay_micros = now;
-    } else if (_sitl && (now - wind_start_delay_micros) > 5000000 ) {
-        // The EKF does not like step inputs so this LPF keeps it happy.
-        uint32_t dt_us = now - last_wind_update_us;
-        if (dt_us > 1000) {
-            last_wind_update_us = now;
-            // slew wind based on the configured time constant
-            const float dt = dt_us * 1.0e-6;
-            const float tc = MAX(_sitl->wind_change_tc, 0.1);
-            const float alpha = calc_lowpass_alpha_dt(dt, 1.0/tc);
-            _sitl->wind_speed_active     += (_sitl->wind_speed - _sitl->wind_speed_active) * alpha;
-            _sitl->wind_direction_active += (wrap_180(_sitl->wind_direction - _sitl->wind_direction_active)) * alpha;
-            _sitl->wind_dir_z_active     += (_sitl->wind_dir_z - _sitl->wind_dir_z_active) * alpha;
-            _sitl->wind_direction_active = wrap_180(_sitl->wind_direction_active);
-        }
-        wind_speed =     _sitl->wind_speed_active;
-        wind_direction = _sitl->wind_direction_active;
-        wind_dir_z =     _sitl->wind_dir_z_active;
-        
-        // pass wind into simulators using different wind types via param SIM_WIND_T*.
-        switch (_sitl->wind_type) {
-        case SITL::SIM::WIND_TYPE_SQRT:
-            if (altitude < _sitl->wind_type_alt) {
-                wind_speed *= sqrtf(MAX(altitude / _sitl->wind_type_alt, 0));
-            }
-            break;
-
-        case SITL::SIM::WIND_TYPE_COEF:
-            wind_speed += (altitude - _sitl->wind_type_alt) * _sitl->wind_type_coef;
-            break;
-
-        case SITL::SIM::WIND_TYPE_NO_LIMIT:
-        default:
-            break;
-        }
-
-        // never allow negative wind velocity
-        wind_speed = MAX(wind_speed, 0);
-    }
-
-    input.wind.speed = wind_speed;
-    input.wind.direction = wind_direction;
-    input.wind.turbulence = _sitl?_sitl->wind_turbulance:0;
-    input.wind.dir_z = wind_dir_z;
+#if AP_SIM_WIND_SIMULATION_ENABLED
+    hal.simstate->update_simulated_wind(input);
+#endif  // AP_SIM_WIND_SIMULATION_ENABLED
 
     for (uint8_t i=0; i<SITL_NUM_CHANNELS; i++) {
         if (pwm_output[i] == 0xFFFF) {
@@ -380,37 +300,47 @@ void SITL_State::_simulator_servos(struct sitl_input &input)
         }
     }
 
-    if (_sitl != nullptr) {
-        // FETtec ESC simulation support.  Input signals of 1000-2000
-        // are positive thrust, 0 to 1000 are negative thrust.  Deeper
-        // changes required to support negative thrust - potentially
-        // adding a field to input.
-        if (_sitl != nullptr) {
-            if (_sitl->fetteconewireesc_sim.enabled()) {
-                _sitl->fetteconewireesc_sim.update_sitl_input_pwm(input);
-                for (uint8_t i=0; i<ARRAY_SIZE(input.servos); i++) {
-                    if (input.servos[i] != 0 && input.servos[i] < 1000) {
-                        AP_HAL::panic("Bad input servo value (%u)", input.servos[i]);
-                    }
-                }
+    // FETtec ESC simulation support.  Input signals of 1000-2000
+    // are positive thrust, 0 to 1000 are negative thrust.  Deeper
+    // changes required to support negative thrust - potentially
+    // adding a field to input.
+    if (_sitl->fetteconewireesc_sim.enabled()) {
+        _sitl->fetteconewireesc_sim.update_sitl_input_pwm(input);
+        for (uint8_t i=0; i<ARRAY_SIZE(input.servos); i++) {
+            if (input.servos[i] != 0 && input.servos[i] < 1000) {
+                AP_HAL::panic("Bad input servo value (%u)", input.servos[i]);
             }
         }
     }
 
-    float engine_mul = _sitl?_sitl->engine_mul.get():1;
-    uint8_t engine_fail = _sitl?_sitl->engine_fail.get():0;
-    float throttle = 0.0f;
-    
-    if (engine_fail >= ARRAY_SIZE(input.servos)) {
-        engine_fail = 0;
+#if AP_SIM_VOLZ_ENABLED
+    // update simulation input based on data received via "serial" to
+    // Volz servos:
+    if (_sitl->volz_sim.enabled()) {
+        _sitl->volz_sim.update_sitl_input_pwm(input);
+        for (uint8_t i=0; i<ARRAY_SIZE(input.servos); i++) {
+            if (input.servos[i] != 0 && input.servos[i] < 1000) {
+                AP_HAL::panic("Bad input servo value (%u)", input.servos[i]);
+            }
+        }
     }
+#endif
+
+    const float engine_mul = _sitl->engine_mul.get();
+    const uint32_t engine_fail = _sitl->engine_fail.get();
+
     // apply engine multiplier to motor defined by the SIM_ENGINE_FAIL parameter
-    if (_vehicle != Rover) {
-        input.servos[engine_fail] = ((input.servos[engine_fail]-1000) * engine_mul) + 1000;
-    } else {
-        input.servos[engine_fail] = static_cast<uint16_t>(((input.servos[engine_fail] - 1500) * engine_mul) + 1500);
+    for (uint8_t i=0; i<ARRAY_SIZE(input.servos); i++) {
+        if (engine_fail & (1<<i)) {
+            if (_vehicle != Rover) {
+                input.servos[i] = ((input.servos[i]-1000) * engine_mul) + 1000;
+            } else {
+                input.servos[i] = static_cast<uint16_t>(((input.servos[i] - 1500) * engine_mul) + 1500);
+            }
+        }
     }
 
+    float throttle = 0.0f; // 0 is 'no throttle', 1.0 is 'full' throttle
     if (_vehicle == ArduPlane) {
         float forward_throttle = constrain_float((input.servos[2] - 1000) / 1000.0f, 0.0f, 1.0f);
         // do a little quadplane dance
@@ -437,9 +367,12 @@ void SITL_State::_simulator_servos(struct sitl_input &input)
             throttle = hover_throttle;
         }
     } else if (_vehicle == Rover) {
-        input.servos[2] = static_cast<uint16_t>(constrain_int16(input.servos[2], 1000, 2000));
-        input.servos[0] = static_cast<uint16_t>(constrain_int16(input.servos[0], 1000, 2000));
-        throttle = fabsf((input.servos[2] - 1500) / 500.0f);
+        if (input.servos[2] != 0) {
+            const uint16_t servo2 = static_cast<uint16_t>(constrain_int16(input.servos[2], 1000, 2000));
+            throttle = fabsf((servo2 - 1500) / 500.0f);
+        } else {
+            throttle = 0;
+        }
     } else {
         // run checks on each motor
         uint8_t running_motors = 0;
@@ -459,11 +392,9 @@ void SITL_State::_simulator_servos(struct sitl_input &input)
             throttle /= running_motors;
         }
     }
-    if (_sitl) {
-        _sitl->throttle = throttle;
-    }
+    _sitl->throttle = throttle;
 
-    update_voltage_current(input, throttle);
+    set_voltage_current_pins(sitl_model->get_battery_voltage(), sitl_model->get_battery_current());
 }
 
 void SITL_State::init(int argc, char * const argv[])
@@ -490,8 +421,7 @@ void SITL_State::set_height_agl(void)
     }
 
 #if AP_TERRAIN_AVAILABLE
-    if (_sitl != nullptr &&
-        _sitl->terrain_enable) {
+    if (_sitl->terrain_enable) {
         // get height above terrain from AP_Terrain. This assumes
         // AP_Terrain is working
         float terrain_height_amsl;
@@ -508,10 +438,8 @@ void SITL_State::set_height_agl(void)
     }
 #endif
 
-    if (_sitl != nullptr) {
-        // fall back to flat earth model
-        _sitl->state.height_agl = _sitl->state.altitude - home_alt;
-    }
+    // fall back to flat earth model
+    _sitl->state.height_agl = _sitl->state.altitude - home_alt;
 }
 
 /*

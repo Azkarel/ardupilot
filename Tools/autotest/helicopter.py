@@ -4,17 +4,18 @@ Fly Helicopter in SITL
 AP_FLAKE8_CLEAN
 '''
 
-from __future__ import print_function
-
-from arducopter import AutoTestCopter
-
-import vehicle_test_suite
-from vehicle_test_suite import NotAchievedException, AutoTestTimeoutException
+import copy
+import math
+import operator
 
 from pymavlink import mavutil
-from pysim import vehicleinfo
 
-import copy
+import vehicle_test_suite
+
+from arducopter import AutoTestCopter
+from pysim import vehicleinfo
+from vehicle_test_suite import AutoTestTimeoutException
+from vehicle_test_suite import NotAchievedException
 
 
 class AutoTestHelicopter(AutoTestCopter):
@@ -33,12 +34,14 @@ class AutoTestHelicopter(AutoTestCopter):
     def sitl_start_location(self):
         return self.sitl_start_loc
 
-    def default_speedup(self):
-        '''Heli seems to be race-free'''
-        return 100
-
     def is_heli(self):
         return True
+
+    def subgroupvarptr_activation_params(self):
+        ret = super(AutoTestHelicopter, self).subgroupvarptr_activation_params()
+        # AC_CustomControl is disabled on heli (AC_CUSTOMCONTROL_MULTI_ENABLED is false)
+        ret.pop("CC_TYPE", None)
+        return ret
 
     def rc_defaults(self):
         ret = super(AutoTestHelicopter, self).rc_defaults()
@@ -57,19 +60,19 @@ class AutoTestHelicopter(AutoTestCopter):
         self.progress("Skipping loiter-requires-position for heli; rotor runup issues")
 
     def get_collective_out(self):
-        servo = self.mav.recv_match(type='SERVO_OUTPUT_RAW', blocking=True)
+        servo = self.assert_receive_message('SERVO_OUTPUT_RAW')
         chan_pwm = (servo.servo1_raw + servo.servo2_raw + servo.servo3_raw)/3.0
         return chan_pwm
 
     def RotorRunup(self):
-        '''Test rotor runip'''
+        '''Test rotor runup'''
         # Takeoff and landing in Loiter
         TARGET_RUNUP_TIME = 10
         self.zero_throttle()
         self.change_mode('LOITER')
         self.wait_ready_to_arm()
         self.arm_vehicle()
-        servo = self.mav.recv_match(type='SERVO_OUTPUT_RAW', blocking=True)
+        servo = self.assert_receive_message('SERVO_OUTPUT_RAW')
         coll = servo.servo1_raw
         coll = coll + 50
         self.set_parameter("H_RSC_RUNUP_TIME", TARGET_RUNUP_TIME)
@@ -79,7 +82,10 @@ class AutoTestHelicopter(AutoTestCopter):
         self.progress("Collective threshold PWM %u" % coll)
         tstart = self.get_sim_time()
         self.progress("Wait that collective PWM pass threshold value")
-        servo = self.mav.recv_match(condition='SERVO_OUTPUT_RAW.servo1_raw>%u' % coll, blocking=True)
+        servo = self.assert_receive_message(
+            "SERVO_OUTPUT_RAW",
+            condition=f'SERVO_OUTPUT_RAW.servo1_raw>{coll}'
+        )
         runup_time = self.get_sim_time() - tstart
         self.progress("Collective is now at PWM %u" % servo.servo1_raw)
         self.mav.wait_heartbeat()
@@ -115,7 +121,7 @@ class AutoTestHelicopter(AutoTestCopter):
         self.set_current_waypoint(1)
 
         # wait for motor runup
-        self.delay_sim_time(20)
+        self.delay_sim_time(20, reason="rotor runup to complete")
 
         # switch into AUTO mode and raise throttle
         self.change_mode('AUTO')
@@ -155,14 +161,14 @@ class AutoTestHelicopter(AutoTestCopter):
         self.progress("wait for rotor runup to complete")
         if self.get_parameter("H_RSC_MODE") == 4:
             self.context_collect('STATUSTEXT')
-            self.wait_statustext("Governor Engaged", check_context=True)
+            self.wait_statustext("Runup Complete", check_context=True)
         elif self.get_parameter("H_RSC_MODE") == 3:
             self.wait_rpm(1, 1300, 1400)
         else:
             self.wait_servo_channel_value(8, 1659, timeout=10)
 
         # wait for motor runup
-        self.delay_sim_time(20)
+        self.delay_sim_time(20, reason="rotor runup to complete")
 
         if mode == 'GUIDED':
             self.user_takeoff(alt_min=alt_min)
@@ -218,13 +224,218 @@ class AutoTestHelicopter(AutoTestCopter):
         self.takeoff(10)
         self.do_RTL()
 
+    def GovernorNotEngagedManualThrottle(self):
+        '''check runup complete and land-complete clear in manual throttle modes when governor never engages'''
+        self.customise_SITL_commandline(
+            [],
+            defaults_filepath=self.model_defaults_filepath('heli-gas'),
+            model="heli-gas",
+            wipe=True,
+        )
+        # AutoThrottle RSC mode with the rotor speed sensor removed;
+        # without RPM feedback the governor can never engage:
+        self.set_parameters({
+            "H_RSC_MODE": 4,
+            "RPM1_TYPE": 0,
+        })
+        self.reboot_sitl()
+
+        self.context_collect('STATUSTEXT')
+        self.context_set_message_rate_hz(id=mavutil.mavlink.MAVLINK_MSG_ID_EXTENDED_SYS_STATE, rate_hz=1)
+
+        self.change_mode('ALT_HOLD')
+        self.wait_ready_to_arm()
+        self.arm_vehicle()
+        self.progress("Raising rotor speed")
+        self.set_rc(8, 2000)
+
+        # wait beyond the rotor ramp and runup timers:
+        runup_time = (self.get_parameter("H_RSC_RAMP_TIME") +
+                      self.get_parameter("H_RSC_RUNUP_TIME"))
+        self.delay_sim_time(runup_time + 10, reason="rotor ramp and runup timers to expire")
+
+        # in a non-manual-throttle mode runup must not be declared
+        # complete until the governor engages:
+        if self.statustext_in_collections("Runup Complete") is not None:
+            raise NotAchievedException(
+                "Runup completed without governor engaged in non-manual throttle mode")
+
+        self.progress("Switching to a manual throttle mode")
+        self.change_mode('STABILIZE')
+        self.wait_statustext("Governor Failed to Engage when Runup Completed", check_context=True, timeout=30)
+
+        self.progress("Take off and check land-complete is cleared")
+        self.assert_extended_sys_state(
+            vtol_state=mavutil.mavlink.MAV_VTOL_STATE_MC,
+            landed_state=mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND,
+        )
+        self.set_rc(3, 1700)
+        self.wait_altitude(5, 30, relative=True, timeout=60)
+        self.hover()
+        self.wait_extended_sys_state(
+            vtol_state=mavutil.mavlink.MAV_VTOL_STATE_MC,
+            landed_state=mavutil.mavlink.MAV_LANDED_STATE_IN_AIR,
+            timeout=10,
+        )
+
+        self.do_RTL()
+
+    def DDFPTail(self):
+        # simple check to ensure servo output to DDFP tail is working
+        '''Test DDFP Tail Rotor'''
+        self.customise_SITL_commandline(
+            [],
+            defaults_filepath=self.model_defaults_filepath('heli-ddfptail'),
+            model="heli-ddfptail",
+            wipe=True,
+        )
+        self.takeoff(10)
+        self.wait_servo_channel_value(4, 1403, timeout=10)
+        self.do_RTL()
+
+    def DDVPTail(self):
+        # simple check to ensure servo output to DDVP tail is working
+        '''Test DDVP Tail Rotor'''
+        self.customise_SITL_commandline(
+            [],
+            defaults_filepath=self.model_defaults_filepath('heli-ddvptail'),
+            model="heli-ddvptail",
+            wipe=True,
+        )
+        self.takeoff(10)
+        self.wait_servo_channel_value(7, 2000, timeout=10)
+        self.do_RTL()
+
+    def HeliQuad(self):
+        '''fly collective-pitch quad frame'''
+        self.customise_SITL_commandline(
+            [],
+            defaults_filepath=self.model_defaults_filepath('heli-quad'),
+            model="heli-quad:@ROMFS/models/heliquad.json",
+            wipe=True,
+        )
+        self.takeoff(10)
+        self.do_RTL()
+
+    def HeliQuadFlip(self):
+        '''fly Flip mode on collective-pitch quad frame'''
+        self.customise_SITL_commandline(
+            [],
+            defaults_filepath=self.model_defaults_filepath('heli-quad'),
+            model="heli-quad:@ROMFS/models/heliquad.json",
+            wipe=True,
+        )
+        # pitch flips are skipped; unlike a fixed-pitch quad, whose
+        # throttle cut during the flip also cuts control authority,
+        # the heli-quad retains full authority at zero collective and
+        # rotates well past the commanded rate. The recovery then
+        # leaves the attitude target wedged at the pitch-90 Euler
+        # singularity, from which ALT_HOLD's euler-angle input
+        # shaping cannot recover cleanly
+        self.ModeFlip(do_pitch_flip=False)
+
+    def fly_inverted_flight(self, collective_servos=None, yaw_tolerance=20):
+        '''engage inverted flight from a hover in ALT_HOLD and verify that the
+        vehicle stays inverted and holds altitude, then recover.  Assumes the
+        frame has already been set up and the vehicle is disarmed.  If
+        collective_servos is given those servo channels must reach negative
+        blade pitch (PWM below mid) while inverted.  yaw_tolerance is the
+        allowed heading drift in degrees, or None to not check heading (a
+        single tail rotor re-trims when inverted and drifts slowly).'''
+        rc_option_inverted = 43
+        self.set_parameter("RC10_OPTION", rc_option_inverted)
+        self.set_rc(10, 1000)
+        # clear any interlock/throttle override left over from a previous
+        # frame's attempt, so the vehicle can pass its arming checks
+        self.zero_throttle()
+        self.set_rc(8, 1000)
+        self.takeoff(30, mode='ALT_HOLD')
+
+        self.progress("Engaging inverted flight")
+        self.set_rc(10, 2000)
+        tstart = self.get_sim_time()
+        while True:
+            if self.get_sim_time_cached() - tstart > 15:
+                raise NotAchievedException("Did not roll inverted")
+            m = self.assert_receive_message('ATTITUDE')
+            if abs(math.degrees(m.roll)) > 150:
+                break
+
+        self.progress("Holding inverted flight")
+        hold_alt = self.get_altitude(relative=True)
+        m = self.assert_receive_message('ATTITUDE')
+        hold_yaw_deg = math.degrees(m.yaw)
+        max_collective = 1000
+        tstart = self.get_sim_time()
+        while self.get_sim_time_cached() - tstart < 10:
+            m = self.assert_receive_message('ATTITUDE')
+            roll_deg = math.degrees(m.roll)
+            if abs(roll_deg) < 150:
+                raise NotAchievedException(f"Did not stay inverted (roll {roll_deg:.1f})")
+            if yaw_tolerance is not None:
+                yaw_err = (math.degrees(m.yaw) - hold_yaw_deg + 180) % 360 - 180
+                if abs(yaw_err) > yaw_tolerance:
+                    raise NotAchievedException(f"Did not hold heading while inverted (err {yaw_err:.1f}deg)")
+            alt = self.get_altitude(relative=True)
+            if abs(alt - hold_alt) > 5:
+                raise NotAchievedException(f"Lost altitude while inverted ({alt:.1f}m vs {hold_alt:.1f}m)")
+            if collective_servos is not None:
+                servo = self.assert_receive_message('SERVO_OUTPUT_RAW')
+                for n in collective_servos:
+                    max_collective = max(max_collective, getattr(servo, f"servo{n}_raw"))
+        if collective_servos is not None and max_collective >= 1500:
+            raise NotAchievedException("Rotor not at negative collective while inverted (max %u)" % max_collective)
+        self.progress("Inverted flight held altitude and heading")
+
+        self.progress("Disengaging inverted flight")
+        self.set_rc(10, 1000)
+        self.wait_attitude(desroll=0, despitch=0, tolerance=10, timeout=15)
+
+    def HeliQuadInvertedFlight(self):
+        '''fly inverted on collective-pitch quad frame'''
+        self.customise_SITL_commandline(
+            [],
+            defaults_filepath=self.model_defaults_filepath('heli-quad'),
+            model="heli-quad:@ROMFS/models/heliquad.json",
+            wipe=True,
+        )
+        # the four collective servos must swing to negative blade pitch
+        self.fly_inverted_flight(collective_servos=(1, 2, 3, 4))
+        self.do_RTL()
+
+    def HeliSingleInvertedFlight(self):
+        '''attempt inverted flight on heli single frame and check the set that
+        succeeds matches expectations'''
+        # parameters that let the traditional heli frames push the collective
+        # negative far enough to hold inverted flight; set for this test only.
+        # IM_STB_COL_* only affect STABILIZE collective; the maneuver flies in
+        # ALT_HOLD so they are belt-and-braces.
+        inverted_params = {
+            "H_COL_MIN": 1260,
+            "H_COL_ANG_MIN": -12,
+            "ATC_RATE_R_MAX": 120,
+            "ATC_RATE_P_MAX": 120,
+            "IM_STB_COL_1": 40,
+            "IM_STB_COL_2": 70,
+            "IM_STB_COL_3": 80,
+        }
+        self.customise_SITL_commandline(
+            [],
+            defaults_filepath=self.model_defaults_filepath('heli'),
+            model="heli",
+            wipe=True,
+        )
+        self.set_parameters(inverted_params)
+        self.fly_inverted_flight(yaw_tolerance=30)
+        self.do_RTL()
+
     def hover(self):
         self.progress("Setting hover collective")
         self.set_rc(3, 1500)
 
     def PosHoldTakeOff(self):
         """ensure vehicle stays put until it is ready to fly"""
-        self.set_parameter("PILOT_TKOFF_ALT", 700)
+        self.set_parameter("PILOT_TKO_ALT_M", 7.0)
         self.change_mode('POSHOLD')
         self.zero_throttle()
         self.set_rc(8, 1000)
@@ -235,7 +446,7 @@ class AutoTestHelicopter(AutoTestCopter):
         self.set_rc(8, 2000)
         self.progress("wait for rotor runup to complete")
         self.wait_servo_channel_value(8, 1659, timeout=10)
-        self.delay_sim_time(20)
+        self.delay_sim_time(20, reason="rotor runup to complete")
         # check we are still on the ground...
         max_relalt = 1  # metres
         relative_alt = self.get_altitude(relative=True)
@@ -245,7 +456,7 @@ class AutoTestHelicopter(AutoTestCopter):
 
         self.progress("Pushing collective past half-way")
         self.set_rc(3, 1600)
-        self.delay_sim_time(0.5)
+        self.delay_sim_time(0.5, reason="collective input to settle")
         self.hover()
 
         # make sure we haven't already reached alt:
@@ -271,7 +482,7 @@ class AutoTestHelicopter(AutoTestCopter):
         self.set_rc(8, 2000)
         self.progress("wait for rotor runup to complete")
         self.wait_servo_channel_value(8, 1659, timeout=10)
-        self.delay_sim_time(20)
+        self.delay_sim_time(20, reason="rotor runup to complete")
         # check we are still on the ground...
         relative_alt = self.get_altitude(relative=True)
         if abs(relative_alt) > 0.1:
@@ -294,61 +505,23 @@ class AutoTestHelicopter(AutoTestCopter):
         self.arm_vehicle()
         self.progress("Raising rotor speed")
         self.set_rc(8, 2000)
-        self.delay_sim_time(20)
+        self.delay_sim_time(20, reason="rotor to reach speed")
         self.change_mode("AUTO")
         self.set_rc(3, 1500)
         self.wait_disarmed(timeout=600)
         self.progress("Lowering rotor speed")
         self.set_rc(8, 1000)
 
-    def AutoRotation(self, timeout=600):
+    def Autorotation(self, timeout=600):
         """Check engine-out behaviour"""
-        self.set_parameter("AROT_ENABLE", 1)
-        start_alt = 100 # metres
-        self.set_parameter("PILOT_TKOFF_ALT", start_alt * 100)
-        self.change_mode('POSHOLD')
-        self.set_rc(3, 1000)
-        self.set_rc(8, 1000)
-        self.wait_ready_to_arm()
-        self.arm_vehicle()
-        self.set_rc(8, 2000)
-        self.progress("wait for rotor runup to complete")
-        self.wait_servo_channel_value(8, 1659, timeout=10)
-        self.delay_sim_time(20)
-        self.set_rc(3, 2000)
-        self.wait_altitude(start_alt - 1,
-                           (start_alt + 5),
-                           relative=True,
-                           timeout=timeout)
-        self.context_collect('STATUSTEXT')
-        self.progress("Triggering autorotate by raising interlock")
-        self.set_rc(3, 1000)
-        self.set_rc(8, 1000)
-
-        self.wait_statustext("SS Glide Phase", check_context=True)
-
-        self.change_mode('STABILIZE')
-        self.wait_statustext(r"SIM Hit ground at ([0-9.]+) m/s",
-                             check_context=True,
-                             regex=True)
-        speed = float(self.re_match.group(1))
-        if speed > 30:
-            raise NotAchievedException("Hit too hard")
-        self.wait_disarmed()
-
-    def ManAutoRotation(self, timeout=600):
-        """Check autorotation power recovery behaviour"""
-        RAMP_TIME = 4
-        AROT_RAMP_TIME = 2
+        self.context_push()
         start_alt = 100 # metres
         self.set_parameters({
-            "H_RSC_AROT_MN_EN": 1,
-            "H_RSC_AROT_ENG_T": AROT_RAMP_TIME,
-            "H_RSC_AROT_IDLE": 20,
-            "H_RSC_RAMP_TIME": RAMP_TIME,
-            "H_RSC_IDLE": 0,
-            "PILOT_TKOFF_ALT": start_alt * 100,
+            "AROT_ENABLE": 1,
+            "H_RSC_AROT_ENBL": 1,
+            "H_COL_LAND_MIN" : -2.0
         })
+        bail_out_time = self.get_parameter('H_RSC_AROT_RUNUP')
         self.change_mode('POSHOLD')
         self.set_rc(3, 1000)
         self.set_rc(8, 1000)
@@ -357,38 +530,34 @@ class AutoTestHelicopter(AutoTestCopter):
         self.set_rc(8, 2000)
         self.progress("wait for rotor runup to complete")
         self.wait_servo_channel_value(8, 1659, timeout=10)
-        self.delay_sim_time(20)
+        self.delay_sim_time(20, reason="rotor runup to complete")
         self.set_rc(3, 2000)
         self.wait_altitude(start_alt - 1,
                            (start_alt + 5),
                            relative=True,
                            timeout=timeout)
         self.context_collect('STATUSTEXT')
-        self.change_mode('STABILIZE')
-        self.progress("Triggering manual autorotation by disabling interlock")
-        self.set_rc(3, 1000)
-        self.set_rc(8, 1000)
-        self.wait_servo_channel_value(8, 1199, timeout=3)
-        self.progress("channel 8 set to autorotation window")
 
-        # wait to establish autorotation
-        self.delay_sim_time(2)
-
-        self.set_rc(8, 2000)
-        self.wait_servo_channel_value(8, 1659, timeout=AROT_RAMP_TIME * 1.1)
-
-        # give time for engine to power up
-        self.set_rc(3, 1400)
-        self.delay_sim_time(2)
-
-        self.progress("in-flight power recovery")
+        # Reset collective to enter hover
         self.set_rc(3, 1500)
-        self.delay_sim_time(5)
 
-        # initiate autorotation again
-        self.set_rc(3, 1000)
+        # Change to the autorotation flight mode
+        self.progress("Triggering autorotate mode")
+        self.change_mode('AUTOROTATE')
+
+        # Disengage the interlock to remove power
         self.set_rc(8, 1000)
 
+        # Ensure we have progressed through the mode's state machine
+        self.wait_statustext("Glide Phase", check_context=True)
+
+        self.progress("Testing bailout from autorotation")
+        self.set_rc(8, 2000)
+        # See if the output ramps to a value close to expected with the prescribed time
+        self.wait_servo_channel_value(8, 1659, timeout=bail_out_time+1, comparator=operator.ge)
+
+        # Successfully bailed out, disengage the interlock and allow autorotation to progress
+        self.set_rc(8, 1000)
         self.wait_statustext(r"SIM Hit ground at ([0-9.]+) m/s",
                              check_context=True,
                              regex=True)
@@ -396,48 +565,177 @@ class AutoTestHelicopter(AutoTestCopter):
         if speed > 30:
             raise NotAchievedException("Hit too hard")
 
+        # Set throttle low to trip auto disarm
         self.set_rc(3, 1000)
-        # verify servo 8 resets to RSC_IDLE after land complete
-        self.wait_servo_channel_value(8, 1000, timeout=3)
+
         self.wait_disarmed()
+        self.context_pop()
 
-    def mission_item_home(self, target_system, target_component):
-        '''returns a mission_item_int which can be used as home in a mission'''
-        return self.mav.mav.mission_item_int_encode(
-            target_system,
-            target_component,
-            0, # seq
-            mavutil.mavlink.MAV_FRAME_GLOBAL_INT,
-            mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-            0, # current
-            0, # autocontinue
-            3, # p1
-            0, # p2
-            0, # p3
-            0, # p4
-            int(1.0000 * 1e7), # latitude
-            int(2.0000 * 1e7), # longitude
-            31.0000, # altitude
-            mavutil.mavlink.MAV_MISSION_TYPE_MISSION)
+    def AutorotationPreArm(self):
+        """Check autorotation pre-arms are working"""
+        self.context_push()
+        self.start_subtest("Check pass when autorotation mode not enabled")
+        self.set_parameters({
+            "AROT_ENABLE": 0,
+            "RPM1_TYPE": 0
+        })
+        self.reboot_sitl()
+        try:
+            self.wait_statustext("PreArm: AROT: RPM1 not enabled", timeout=50)
+            raise NotAchievedException("Received AROT prearm when not AROT not enabled")
+        except AutoTestTimeoutException:
+            # We want to hit the timeout on wait_statustext()
+            pass
 
-    def mission_item_takeoff(self, target_system, target_component):
-        '''returns a mission_item_int which can be used as takeoff in a mission'''
-        return self.mav.mav.mission_item_int_encode(
-            target_system,
-            target_component,
-            1, # seq
-            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0, # current
-            0, # autocontinue
-            0, # p1
-            0, # p2
-            0, # p3
-            0, # p4
-            int(1.0000 * 1e7), # latitude
-            int(1.0000 * 1e7), # longitude
-            31.0000, # altitude
-            mavutil.mavlink.MAV_MISSION_TYPE_MISSION)
+        self.start_subtest("Check pre-arm fails when autorotation mode enabled")
+        self.set_parameter("AROT_ENABLE", 1)
+        self.wait_statustext("PreArm: AROT: RPM1 not enabled", timeout=50)
+        self.set_parameter("RPM1_TYPE", 10) # reboot required to take effect
+        self.reboot_sitl()
+
+        self.start_subtest("Check pre-arm fails with bad HS_Sensor config")
+        self.context_push()
+        self.set_parameter("AROT_HS_SENSOR", -1)
+        self.wait_statustext("PreArm: AROT: RPM instance <0", timeout=50)
+        self.context_pop()
+
+        self.start_subtest("Check pre-arm fails with bad RSC config")
+        self.wait_statustext("PreArm: AROT: H_RSC_AROT_* not configured", timeout=50)
+
+        self.start_subtest("Check pre-arms clear with all issues corrected")
+        self.set_parameter("H_RSC_AROT_ENBL", 1)
+        self.wait_ready_to_arm()
+
+        self.context_pop()
+
+    def ManAutorotation(self, timeout=600):
+        """Check autorotation power recovery behaviour"""
+        RSC_CHAN = 8
+
+        def check_rsc_output(self, throttle, timeout):
+            # Check we get a sensible throttle output
+            expected_pwm = int(throttle * 0.01 * 1000 + 1000)
+
+            # Help out the detection by accepting some margin
+            margin = 2
+
+            # See if the output ramps to a value close to expected with the prescribed time
+            self.wait_servo_channel_in_range(RSC_CHAN, expected_pwm-margin, expected_pwm+margin, timeout=timeout)
+
+        def TestAutorotationConfig(self, rsc_idle, arot_ramp_time, arot_idle, cool_down):
+            RAMP_TIME = 10
+            RUNUP_TIME = 15
+            AROT_RUNUP_TIME = arot_ramp_time + 4
+            RSC_SETPOINT = 66
+            self.set_parameters({
+                "H_RSC_AROT_ENBL": 1,
+                "H_RSC_AROT_RAMP": arot_ramp_time,
+                "H_RSC_AROT_RUNUP": AROT_RUNUP_TIME,
+                "H_RSC_AROT_IDLE": arot_idle,
+                "H_RSC_RAMP_TIME": RAMP_TIME,
+                "H_RSC_RUNUP_TIME": RUNUP_TIME,
+                "H_RSC_IDLE": rsc_idle,
+                "H_RSC_SETPOINT": RSC_SETPOINT,
+                "H_RSC_CLDWN_TIME": cool_down
+            })
+
+            # Check the RSC config so we know what to expect on the throttle output
+            if self.get_parameter("H_RSC_MODE") != 2:
+                self.set_parameter("H_RSC_MODE", 2)
+                self.reboot_sitl()
+
+            self.change_mode('POSHOLD')
+            self.set_rc(3, 1000)
+            self.set_rc(8, 1000)
+            self.wait_ready_to_arm()
+            self.arm_vehicle()
+            self.set_rc(8, 2000)
+            self.progress("wait for rotor runup to complete")
+            check_rsc_output(self, RSC_SETPOINT, RUNUP_TIME+1)
+
+            self.delay_sim_time(20, reason="rotor runup to complete")
+            self.set_rc(3, 2000)
+            self.wait_altitude(100,
+                               105,
+                               relative=True,
+                               timeout=timeout)
+            self.context_collect('STATUSTEXT')
+            self.change_mode('STABILIZE')
+
+            self.progress("Triggering manual autorotation by disabling interlock")
+            self.set_rc(3, 1000)
+            self.set_rc(8, 1000)
+
+            self.wait_statustext(r"RSC: In Autorotation", check_context=True)
+
+            # Check we are using the correct throttle output. This should happen instantly on ramp down.
+            idle_thr = rsc_idle
+            if (arot_idle > 0):
+                idle_thr = arot_idle
+
+            check_rsc_output(self, idle_thr, 1)
+
+            self.progress("RSC is outputting correct idle throttle")
+
+            # Wait to establish autorotation.
+            self.delay_sim_time(2, reason="autorotation to establish")
+
+            # Re-engage interlock to start bailout sequence
+            self.set_rc(8, 2000)
+
+            # Ensure we see the bailout state
+            self.wait_statustext("RSC: Bailing Out", check_context=True)
+
+            # Check we are back up to flight throttle. Autorotation ramp up time should be used
+            check_rsc_output(self, RSC_SETPOINT, arot_ramp_time+1)
+
+            # Give time for engine to power up
+            self.set_rc(3, 1400)
+            self.delay_sim_time(2, reason="engine to power up")
+
+            self.progress("in-flight power recovery")
+            self.set_rc(3, 1500)
+            self.delay_sim_time(5, reason="power recovery to stabilise")
+
+            # Initiate autorotation again
+            self.set_rc(3, 1000)
+            self.set_rc(8, 1000)
+
+            self.wait_statustext(r"SIM Hit ground at ([0-9.]+) m/s",
+                                 check_context=True,
+                                 regex=True)
+            speed = float(self.re_match.group(1))
+            if speed > 30:
+                raise NotAchievedException("Hit too hard")
+
+            # Check that cool down is still used correctly if set
+            # First wait until we are out of the autorotation state
+            self.wait_statustext("RSC: Autorotation Stopped")
+            if (cool_down > 0):
+                check_rsc_output(self, rsc_idle*1.5, cool_down)
+
+            # Verify RSC output resets to RSC_IDLE after land complete
+            check_rsc_output(self, rsc_idle, 20)
+            self.wait_disarmed()
+
+        # We test the bailout behavior of two different configs
+        # First we test config with a regular throttle curve
+        self.start_subtest("testing autorotation with throttle curve config")
+        self.context_push()
+        TestAutorotationConfig(self, rsc_idle=5.0, arot_ramp_time=2.0, arot_idle=0, cool_down=0)
+
+        # Now we test a config that would be used with an ESC with internal governor and an autorotation window
+        self.start_subtest("testing autorotation with ESC autorotation window config")
+        TestAutorotationConfig(self, rsc_idle=0.0, arot_ramp_time=0.0, arot_idle=20.0, cool_down=0)
+
+        # Check rsc output behavior when using the cool down feature
+        self.start_subtest("testing autorotation with cool down enabled and zero autorotation idle")
+        TestAutorotationConfig(self, rsc_idle=5.0, arot_ramp_time=2.0, arot_idle=0, cool_down=5.0)
+
+        self.start_subtest("testing that H_RSC_AROT_IDLE is used over RSC_IDLE when cool down is enabled")
+        TestAutorotationConfig(self, rsc_idle=5.0, arot_ramp_time=2.0, arot_idle=10, cool_down=5.0)
+
+        self.context_pop()
 
     def mission_item_rtl(self, target_system, target_component):
         '''returns a mission_item_int which can be used as takeoff in a mission'''
@@ -510,7 +808,7 @@ class AutoTestHelicopter(AutoTestCopter):
             # slot 0 is home
             self.mission_item_home(target_system=target_system, target_component=target_component),
             # slot 1 is takeoff
-            self.mission_item_takeoff(target_system=target_system, target_component=target_component),
+            self.mission_item_copter_takeoff(target_system=target_system, target_component=target_component),
             # now three spline waypoints right on top of one another:
             copy.copy(wp2_by_three),
             copy.copy(wp2_by_three),
@@ -584,7 +882,7 @@ class AutoTestHelicopter(AutoTestCopter):
             # slot 0 is home
             self.mission_item_home(target_system=target_system, target_component=target_component),
             # slot 1 is takeoff
-            self.mission_item_takeoff(target_system=target_system, target_component=target_component),
+            self.mission_item_copter_takeoff(target_system=target_system, target_component=target_component),
             wp2,
             wp3,
             wp4,
@@ -619,6 +917,47 @@ class AutoTestHelicopter(AutoTestCopter):
         self.change_mode('LOITER')
         self.fly_mission_points(self.scurve_nasty_up_mission())
 
+    def MountFailsafeAction(self):
+        """Fly Mount Failsafe action"""
+        self.context_push()
+
+        self.progress("Setting up servo mount")
+        roll_servo = 12
+        pitch_servo = 11
+        yaw_servo = 10
+        open_servo = 9
+        roll_limit = 50
+        self.set_parameters({
+            "MNT1_TYPE": 1,
+            "SERVO%u_MIN" % roll_servo: 1000,
+            "SERVO%u_MAX" % roll_servo: 2000,
+            "SERVO%u_FUNCTION" % yaw_servo: 6,  # yaw
+            "SERVO%u_FUNCTION" % pitch_servo: 7,  # roll
+            "SERVO%u_FUNCTION" % roll_servo: 8,  # pitch
+            "SERVO%u_FUNCTION" % open_servo: 9,  # mount open
+            "MNT1_OPTIONS": 2,  # retract
+            "MNT1_DEFLT_MODE": 3,  # RC targeting
+            "MNT1_ROLL_MIN": -roll_limit,
+            "MNT1_ROLL_MAX": roll_limit,
+        })
+
+        self.reboot_sitl()
+
+        retract_roll = 25.0
+        self.set_parameter("MNT1_NEUTRAL_X", retract_roll)
+        self.progress("Killing RC")
+        self.set_parameter("SIM_RC_FAIL", 2)
+        want_servo_channel_value = int(1500 + 500*retract_roll/roll_limit)
+        self.wait_servo_channel_value(roll_servo, want_servo_channel_value, epsilon=1, timeout=12)
+
+        self.progress("Resurrecting RC")
+        self.set_parameter("SIM_RC_FAIL", 0)
+        self.wait_servo_channel_value(roll_servo, 1500)
+
+        self.context_pop()
+
+        self.reboot_sitl()
+
     def set_rc_default(self):
         super(AutoTestHelicopter, self).set_rc_default()
         self.progress("Lowering rotor speed")
@@ -630,12 +969,13 @@ class AutoTestHelicopter(AutoTestCopter):
         self.wait_ready_to_arm()
         self.arm_vehicle()
         self.set_rc(8, 2000)    # Raise rotor speed
-        self.delay_sim_time(20)
+        self.delay_sim_time(20, reason="rotor to reach speed")
         self.change_mode("AUTO")
         self.set_rc(3, 1500)
 
         self.wait_waypoint(1, num_wp-1)
         self.wait_disarmed()
+        self.set_rc(3, 1000)
         self.set_rc(8, 1000)    # Lower rotor speed
 
     # FIXME move this & plane's version to common
@@ -697,6 +1037,55 @@ class AutoTestHelicopter(AutoTestCopter):
             self.disarm_vehicle()
             self.context_pop()
 
+    def TurbineCoolDown(self, timeout=200):
+        """Check Turbine Cool Down Feature"""
+        self.context_push()
+        # set option for Turbine
+        RAMP_TIME = 4
+        SETPOINT = 66
+        IDLE = 15
+        COOLDOWN_TIME = 5
+        self.set_parameters({"RC6_OPTION": 161,
+                             "H_RSC_RAMP_TIME": RAMP_TIME,
+                             "H_RSC_SETPOINT": SETPOINT,
+                             "H_RSC_IDLE": IDLE,
+                             "H_RSC_CLDWN_TIME": COOLDOWN_TIME})
+        self.set_rc(3, 1000)
+        self.set_rc(8, 1000)
+
+        self.progress("Starting turbine")
+        self.wait_ready_to_arm()
+        self.context_collect("STATUSTEXT")
+        self.arm_vehicle()
+
+        self.set_rc(6, 2000)
+        self.wait_statustext('Turbine startup', check_context=True)
+
+        # Engage interlock to run up to head speed
+        self.set_rc(8, 2000)
+
+        # Check throttle gets to setpoint
+        expected_thr = SETPOINT * 0.01 * 1000 + 1000 - 1 # servo end points are 1000 to 2000
+        self.wait_servo_channel_value(8, expected_thr, timeout=RAMP_TIME+1, comparator=operator.ge)
+
+        self.progress("Checking cool down behaviour, idle x 1.5")
+        self.set_rc(8, 1000)
+        tstart = self.get_sim_time()
+        expected_thr = IDLE * 1.5 * 0.01 * 1000 + 1000 + 1
+        self.wait_servo_channel_value(8, expected_thr, timeout=2, comparator=operator.le)
+
+        # Check that the throttle drops to idle after cool down time
+        expected_thr = IDLE * 0.01 * 1000 + 1000 + 1
+        self.wait_servo_channel_value(8, expected_thr, timeout=COOLDOWN_TIME+1, comparator=operator.le)
+
+        measured_time = self.get_sim_time() - tstart
+        if (abs(measured_time - COOLDOWN_TIME) > 1.0):
+            raise NotAchievedException('Throttle did not reduce to idle within H_RSC_CLDWN_TIME')
+
+        self.set_rc(6, 1000)
+        self.wait_disarmed(timeout=20)
+        self.context_pop()
+
     def TurbineStart(self, timeout=200):
         """Check Turbine Start Feature"""
         RAMP_TIME = 4
@@ -713,7 +1102,7 @@ class AutoTestHelicopter(AutoTestCopter):
         self.set_rc(6, 2000)
         tstart = self.get_sim_time()
         while self.get_sim_time() - tstart < 2:
-            servo = self.mav.recv_match(type='SERVO_OUTPUT_RAW', blocking=True)
+            servo = self.assert_receive_message('SERVO_OUTPUT_RAW')
             if servo.servo8_raw > 1050:
                 raise NotAchievedException("Turbine Start activated while disarmed")
         self.set_rc(6, 1000)
@@ -726,7 +1115,7 @@ class AutoTestHelicopter(AutoTestCopter):
         self.set_rc(6, 2000)
         tstart = self.get_sim_time()
         while self.get_sim_time() - tstart < 5:
-            servo = self.mav.recv_match(type='SERVO_OUTPUT_RAW', blocking=True)
+            servo = self.assert_receive_message('SERVO_OUTPUT_RAW')
             if servo.servo8_raw > 1660:
                 raise NotAchievedException("Turbine Start activated with interlock enabled")
 
@@ -736,7 +1125,7 @@ class AutoTestHelicopter(AutoTestCopter):
 
         # check that turbine start activates as designed (armed with interlock disabled)
         self.progress("Checking Turbine Start activates as designed (armed with interlock disabled)")
-        self.delay_sim_time(2)
+        self.delay_sim_time(2, reason="vehicle to fully disarm")
         self.arm_vehicle()
 
         self.set_rc(6, 2000)
@@ -744,7 +1133,7 @@ class AutoTestHelicopter(AutoTestCopter):
         while True:
             if self.get_sim_time() - tstart > 5:
                 raise AutoTestTimeoutException("Turbine Start did not activate")
-            servo = self.mav.recv_match(type='SERVO_OUTPUT_RAW', blocking=True)
+            servo = self.assert_receive_message('SERVO_OUTPUT_RAW')
             if servo.servo8_raw > 1800:
                 break
 
@@ -757,7 +1146,7 @@ class AutoTestHelicopter(AutoTestCopter):
         self.set_rc(6, 2000)
         tstart = self.get_sim_time()
         while self.get_sim_time() - tstart < 5:
-            servo = self.mav.recv_match(type='SERVO_OUTPUT_RAW', blocking=True)
+            servo = self.assert_receive_message('SERVO_OUTPUT_RAW')
             if servo.servo8_raw > 1660:
                 raise NotAchievedException("Turbine Start activated with interlock enabled")
         self.set_rc(6, 1000)
@@ -965,6 +1354,53 @@ class AutoTestHelicopter(AutoTestCopter):
         self.progress("Killing rotor speed")
         self.set_rc(8, 1000)
 
+    def assert_not_stick_armed(self, timeout=10):
+        '''raise if the vehicle stick-arms within timeout seconds'''
+        arming_channel = self.get_stick_arming_channel()
+        self.set_output_to_max(arming_channel)
+        tstart = self.get_sim_time()
+        try:
+            while self.get_sim_time_cached() - tstart < timeout:
+                self.wait_heartbeat()
+                if self.armed():
+                    raise NotAchievedException("Stick-armed when it should not have")
+        finally:
+            self.set_output_to_trim(arming_channel)
+
+    def StickArmingRequiresZeroThrottle(self):
+        '''check that stick (rudder) arming requires the collective at zero'''
+
+        '''
+        Reproduces https://github.com/ArduPilot/ardupilot/issues/33386 :
+        a heli could be stick-armed with the collective/throttle stick
+        raised off the bottom stop, a change in behaviour from 4.6 and
+        prior.  Stick arming must require zero throttle.
+        '''
+
+        # test in stabilize mode with rotor interlock disabled
+        self.change_mode('STABILIZE')
+        self.set_rc(8, 1000)
+
+        # check arming is possible with collective at zero
+        self.start_subtest("Stick arming succeeds with collective at zero")
+        self.set_parameter("RC_OPTIONS", 32) # enable Arming check throttle for 0 input
+        self.zero_throttle()
+        self.wait_ready_to_arm()
+        self.arm_motors_with_rc_input()
+        self.disarm_vehicle()
+
+        # check arming fails with collective raised
+        self.start_subtest("Stick arming is refused with collective raised")
+        self.set_rc(3, 1300)
+        self.assert_not_stick_armed()
+
+        # check arming succeeds with RC_OPTIONS arming check disabled
+        self.start_subtest("Stick arming succeeds with collective raised")
+        self.set_parameter("RC_OPTIONS", 0)
+        self.set_rc(3, 1300)
+        self.arm_motors_with_rc_input()
+        self.disarm_vehicle()
+
     def tests(self):
         '''return list of all tests'''
         ret = vehicle_test_suite.TestSuite.tests(self)
@@ -974,15 +1410,26 @@ class AutoTestHelicopter(AutoTestCopter):
             self.PosHoldTakeOff,
             self.StabilizeTakeOff,
             self.SplineWaypoint,
-            self.AutoRotation,
-            self.ManAutoRotation,
+            self.AutorotationPreArm,
+            self.Autorotation,
+            self.ManAutorotation,
             self.governortest,
+            self.GovernorNotEngagedManualThrottle,
             self.FlyEachFrame,
             self.AirspeedDrivers,
             self.TurbineStart,
+            self.TurbineCoolDown,
             self.NastyMission,
             self.PIDNotches,
             self.AutoTune,
+            self.DDFPTail,
+            self.DDVPTail,
+            self.HeliQuad,
+            self.HeliQuadFlip,
+            self.HeliQuadInvertedFlight,
+            self.HeliSingleInvertedFlight,
+            self.MountFailsafeAction,
+            self.StickArmingRequiresZeroThrottle,
         ])
         return ret
 
